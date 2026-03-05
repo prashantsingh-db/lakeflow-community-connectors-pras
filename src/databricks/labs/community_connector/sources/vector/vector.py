@@ -38,6 +38,7 @@ class VectorLakeflowConnect(LakeflowConnect):
         super().__init__(options)
         self._api_url = options.get("api_url", "http://localhost:8686").rstrip("/")
         self._api_token = options.get("api_token", "")
+        self._events_url = options.get("events_url", "").rstrip("/")
         self._session = requests.Session()
         self._session.headers["Content-Type"] = "application/json"
         if self._api_token:
@@ -88,6 +89,8 @@ class VectorLakeflowConnect(LakeflowConnect):
             return self._read_component_metrics(start_offset)
         elif table_name == "health":
             return self._read_health()
+        elif table_name == "ndr_events":
+            return self._read_ndr_events(start_offset)
         raise ValueError(f"Unknown table: {table_name}")
 
     def _validate_table(self, table_name: str) -> None:
@@ -233,3 +236,57 @@ class VectorLakeflowConnect(LakeflowConnect):
             }
         ]
         return iter(records), {}
+
+    def _read_ndr_events(
+        self, start_offset: dict
+    ) -> tuple[Iterator[dict], dict]:
+        """Read NDR events from the buffer server (append).
+
+        Pulls enriched NDR events that Vector pushed to the buffer
+        server via its HTTP sink. Uses received_at as cursor for
+        incremental reads.
+        """
+        if not self._events_url:
+            raise ValueError(
+                "events_url is required for ndr_events table. "
+                "Set it to the buffer server URL (e.g. http://host:9009)."
+            )
+
+        since = start_offset.get("cursor", "") if start_offset else ""
+        params = {"limit": "500"}
+        if since:
+            params["since"] = since
+
+        resp = self._session.get(
+            f"{self._events_url}/events", params=params
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        now = datetime.now(timezone.utc).isoformat()
+        records = []
+        last_received_at = since
+
+        for event in data.get("events", []):
+            received_at = event.get("received_at", now)
+            if received_at > last_received_at:
+                last_received_at = received_at
+
+            records.append({
+                "event_timestamp": event.get("timestamp", now),
+                "src_ip": event.get("src.ip", ""),
+                "dst_ip": event.get("dst.ip", ""),
+                "src_port": event.get("src.port"),
+                "dst_port": event.get("dst.port"),
+                "network_protocol": event.get("network.protocol", ""),
+                "event_type": event.get("event.type", ""),
+                "severity": event.get("severity_text", ""),
+                "sensor_id": event.get("sensor.id", ""),
+                "message": event.get("message", ""),
+                "collected_at": now,
+            })
+
+        end_offset = {"cursor": last_received_at} if last_received_at else {}
+        if not records and start_offset:
+            return iter([]), start_offset
+        return iter(records), end_offset

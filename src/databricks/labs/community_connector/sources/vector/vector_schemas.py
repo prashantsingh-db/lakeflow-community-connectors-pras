@@ -3,6 +3,7 @@
 from pyspark.sql.types import (
     BooleanType,
     DoubleType,
+    IntegerType,
     LongType,
     StringType,
     StructField,
@@ -39,6 +40,21 @@ TABLE_SCHEMAS = {
             StructField("collected_at", TimestampType(), True),
         ]
     ),
+    "ndr_events": StructType(
+        [
+            StructField("event_timestamp", TimestampType(), False),
+            StructField("src_ip", StringType(), True),
+            StructField("dst_ip", StringType(), True),
+            StructField("src_port", IntegerType(), True),
+            StructField("dst_port", IntegerType(), True),
+            StructField("network_protocol", StringType(), True),
+            StructField("event_type", StringType(), True),
+            StructField("severity", StringType(), True),
+            StructField("sensor_id", StringType(), True),
+            StructField("message", StringType(), True),
+            StructField("collected_at", TimestampType(), True),
+        ]
+    ),
 }
 
 TABLE_METADATA = {
@@ -56,5 +72,10 @@ TABLE_METADATA = {
         "primary_keys": ["hostname"],
         "cursor_field": None,
         "ingestion_type": "snapshot",
+    },
+    "ndr_events": {
+        "primary_keys": ["event_timestamp", "src_ip", "src_port"],
+        "cursor_field": "collected_at",
+        "ingestion_type": "append",
     },
 }

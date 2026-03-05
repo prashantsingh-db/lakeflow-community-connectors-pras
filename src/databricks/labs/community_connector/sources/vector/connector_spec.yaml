@@ -16,5 +16,12 @@ connection:
       description: >
         Optional bearer token for Vector API authentication.
         Only required if Vector is configured with api.auth.
+    - name: events_url
+      type: string
+      required: false
+      description: >
+        URL of the Vector events buffer server (e.g. http://buffer-host:9009).
+        Required for ingesting the ndr_events table. The buffer server receives
+        events from Vector's HTTP sink and serves them via GET /events.
 
 external_options_allowlist: ""
