@@ -1,0 +1,20 @@
+# Vector Community Connector Spec
+# Connects to Vector's GraphQL API for pipeline observability.
+
+display_name: Vector
+connection:
+  parameters:
+    - name: api_url
+      type: string
+      required: true
+      description: >
+        URL of the Vector API endpoint (e.g. http://vector-host:8686).
+        Vector must be running with api.enabled = true.
+    - name: api_token
+      type: string
+      required: false
+      description: >
+        Optional bearer token for Vector API authentication.
+        Only required if Vector is configured with api.auth.
+
+external_options_allowlist: ""
