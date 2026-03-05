@@ -21,12 +21,17 @@ RETRIABLE_STATUS_CODES = {429, 500, 502, 503}
 MAX_RETRIES = 3
 INITIAL_BACKOFF = 1.0
 
+# Map component type to kind based on which query returned it
+_KIND_SOURCE = "source"
+_KIND_TRANSFORM = "transform"
+_KIND_SINK = "sink"
+
 
 class VectorLakeflowConnect(LakeflowConnect):
     """LakeflowConnect implementation for Vector observability data pipelines.
 
     Reads pipeline topology, component metrics, and health status
-    from a running Vector instance via its GraphQL API.
+    from a running Vector instance via its GraphQL API (Vector 0.53+).
     """
 
     def __init__(self, options: dict[str, str]) -> None:
@@ -92,178 +97,118 @@ class VectorLakeflowConnect(LakeflowConnect):
                 f"Table '{table_name}' is not supported. Supported: {supported}"
             )
 
-    def _read_topology(self) -> tuple[Iterator[dict], dict]:
-        """Read Vector pipeline topology (snapshot)."""
+    def _fetch_all_components(self) -> list[dict]:
+        """Fetch all components with metrics using per-kind queries.
+
+        Vector's GraphQL exposes sources/transforms/sinks as separate
+        query roots with kind-specific metric fields.
+        """
         query = """{
-            components(first: 1000) {
+            sources(first: 100) {
                 edges {
                     node {
                         componentId
                         componentType
-                        componentKind
+                        metrics {
+                            receivedEventsTotal { receivedEventsTotal }
+                            sentEventsTotal { sentEventsTotal }
+                            receivedBytesTotal { receivedBytesTotal }
+                        }
+                    }
+                }
+            }
+            transforms(first: 100) {
+                edges {
+                    node {
+                        componentId
+                        componentType
+                        metrics {
+                            receivedEventsTotal { receivedEventsTotal }
+                            sentEventsTotal { sentEventsTotal }
+                        }
+                    }
+                }
+            }
+            sinks(first: 100) {
+                edges {
+                    node {
+                        componentId
+                        componentType
+                        metrics {
+                            receivedEventsTotal { receivedEventsTotal }
+                            sentEventsTotal { sentEventsTotal }
+                        }
                     }
                 }
             }
         }"""
         data = self._graphql(query)
+        components = []
+        for kind, key in [
+            (_KIND_SOURCE, "sources"),
+            (_KIND_TRANSFORM, "transforms"),
+            (_KIND_SINK, "sinks"),
+        ]:
+            for edge in data.get(key, {}).get("edges", []):
+                node = edge["node"]
+                metrics = node.get("metrics", {})
+                components.append(
+                    {
+                        "component_id": node["componentId"],
+                        "component_type": node["componentType"],
+                        "component_kind": kind,
+                        "received_events_total": (
+                            metrics.get("receivedEventsTotal", {})
+                            .get("receivedEventsTotal", 0.0)
+                        ),
+                        "sent_events_total": (
+                            metrics.get("sentEventsTotal", {})
+                            .get("sentEventsTotal", 0.0)
+                        ),
+                        "received_bytes_total": (
+                            metrics.get("receivedBytesTotal", {})
+                            .get("receivedBytesTotal", 0.0)
+                        ),
+                    }
+                )
+        return components
+
+    def _read_topology(self) -> tuple[Iterator[dict], dict]:
+        """Read Vector pipeline topology (snapshot)."""
         now = datetime.now(timezone.utc).isoformat()
-        records = []
-        for edge in data.get("components", {}).get("edges", []):
-            node = edge["node"]
-            records.append(
-                {
-                    "component_id": node["componentId"],
-                    "component_type": node["componentType"],
-                    "component_kind": node["componentKind"],
-                    "collected_at": now,
-                }
-            )
+        components = self._fetch_all_components()
+        records = [
+            {
+                "component_id": c["component_id"],
+                "component_type": c["component_type"],
+                "component_kind": c["component_kind"],
+                "collected_at": now,
+            }
+            for c in components
+        ]
         return iter(records), {}
 
     def _read_component_metrics(
         self, start_offset: dict
     ) -> tuple[Iterator[dict], dict]:
         """Read per-component metrics (append). Each call produces a snapshot
-        of current throughput that gets appended to the table."""
-        query = """{
-            components(first: 1000) {
-                edges {
-                    node {
-                        componentId
-                        componentType
-                        componentKind
-                        on {
-                            ... on Source {
-                                outputs {
-                                    sentEventsThroughput
-                                    sentEventsBytesTotalThroughput
-                                }
-                                metrics {
-                                    receivedEventsTotal {
-                                        receivedEventsTotal as totalValue
-                                    }
-                                    sentEventsTotal {
-                                        sentEventsTotal as totalValue
-                                    }
-                                }
-                            }
-                            ... on Transform {
-                                outputs {
-                                    sentEventsThroughput
-                                    sentEventsBytesTotalThroughput
-                                }
-                                metrics {
-                                    receivedEventsTotal {
-                                        receivedEventsTotal as totalValue
-                                    }
-                                    sentEventsTotal {
-                                        sentEventsTotal as totalValue
-                                    }
-                                }
-                            }
-                            ... on Sink {
-                                metrics {
-                                    receivedEventsTotal {
-                                        receivedEventsTotal as totalValue
-                                    }
-                                    sentEventsTotal {
-                                        sentEventsTotal as totalValue
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            componentErrorsTotals {
-                componentId
-                metric {
-                    errorsTotalEvents
-                }
-            }
-        }"""
-        try:
-            data = self._graphql(query)
-        except Exception:
-            # Fall back to simpler query if extended metrics aren't available
-            return self._read_component_metrics_simple(start_offset)
-
+        of current event/byte totals that gets appended to the table."""
         now = datetime.now(timezone.utc).isoformat()
+        components = self._fetch_all_components()
 
-        # Build error map
-        error_map = {}
-        for err in data.get("componentErrorsTotals", []):
-            cid = err.get("componentId", "")
-            total = err.get("metric", {}).get("errorsTotalEvents", 0)
-            error_map[cid] = total
-
-        records = []
-        for edge in data.get("components", {}).get("edges", []):
-            node = edge["node"]
-            cid = node["componentId"]
-
-            # Extract throughput from outputs
-            on_data = node.get("on", {}) or {}
-            outputs = on_data.get("outputs", []) or []
-            sent_throughput = 0.0
-            sent_bytes = 0.0
-            for output in outputs:
-                sent_throughput += output.get("sentEventsThroughput", 0.0) or 0.0
-                sent_bytes += output.get("sentEventsBytesTotalThroughput", 0.0) or 0.0
-
-            records.append(
-                {
-                    "component_id": cid,
-                    "component_type": node["componentType"],
-                    "component_kind": node["componentKind"],
-                    "sent_events_throughput": sent_throughput,
-                    "sent_bytes_throughput": sent_bytes,
-                    "received_events_throughput": 0.0,
-                    "received_bytes_throughput": 0.0,
-                    "errors_total": error_map.get(cid, 0),
-                    "collected_at": now,
-                }
-            )
-
-        end_offset = {"cursor": now}
-        if start_offset and start_offset == end_offset:
-            return iter([]), start_offset
-        return iter(records), end_offset
-
-    def _read_component_metrics_simple(
-        self, start_offset: dict
-    ) -> tuple[Iterator[dict], dict]:
-        """Simplified metrics read using basic GraphQL queries."""
-        topo_query = """{
-            components(first: 1000) {
-                edges {
-                    node {
-                        componentId
-                        componentType
-                        componentKind
-                    }
-                }
+        records = [
+            {
+                "component_id": c["component_id"],
+                "component_type": c["component_type"],
+                "component_kind": c["component_kind"],
+                "sent_events_total": c["sent_events_total"],
+                "received_events_total": c["received_events_total"],
+                "received_bytes_total": c["received_bytes_total"],
+                "errors_total": 0,
+                "collected_at": now,
             }
-        }"""
-        data = self._graphql(topo_query)
-        now = datetime.now(timezone.utc).isoformat()
-
-        records = []
-        for edge in data.get("components", {}).get("edges", []):
-            node = edge["node"]
-            records.append(
-                {
-                    "component_id": node["componentId"],
-                    "component_type": node["componentType"],
-                    "component_kind": node["componentKind"],
-                    "sent_events_throughput": 0.0,
-                    "sent_bytes_throughput": 0.0,
-                    "received_events_throughput": 0.0,
-                    "received_bytes_throughput": 0.0,
-                    "errors_total": 0,
-                    "collected_at": now,
-                }
-            )
+            for c in components
+        ]
 
         end_offset = {"cursor": now}
         if start_offset and start_offset == end_offset:
@@ -273,13 +218,7 @@ class VectorLakeflowConnect(LakeflowConnect):
     def _read_health(self) -> tuple[Iterator[dict], dict]:
         """Read Vector health and meta info (snapshot)."""
         query = """{
-            meta {
-                versionString
-                hostname
-                os
-                arch
-            }
-            uptime
+            meta { versionString hostname }
             health
         }"""
         data = self._graphql(query)
@@ -289,9 +228,6 @@ class VectorLakeflowConnect(LakeflowConnect):
             {
                 "hostname": meta.get("hostname", "unknown"),
                 "version": meta.get("versionString", "unknown"),
-                "os": meta.get("os", "unknown"),
-                "arch": meta.get("arch", "unknown"),
-                "uptime_seconds": int(data.get("uptime", 0)),
                 "is_healthy": data.get("health", False),
                 "collected_at": now,
             }
